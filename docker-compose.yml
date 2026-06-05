@@ -1,0 +1,89 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: admatrix
+      POSTGRES_PASSWORD: admatrix
+      POSTGRES_DB: admatrix
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admatrix"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://admatrix:admatrix@postgres:5432/admatrix
+      REDIS_URL: redis://redis:6379/0
+      QWEN_API_KEY: ${QWEN_API_KEY:-}
+      API_KEY: ${API_KEY:-}
+      DEMO_MODE: ${DEMO_MODE:-false}
+      CORS_ORIGINS: http://localhost:3000
+      VIDEO_OUTPUT_DIR: /tmp/admatrix/videos
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      USE_GUNICORN: ${USE_GUNICORN:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - video_output:/tmp/admatrix
+
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    entrypoint: []
+    command: celery -A app.tasks.video_pipeline.celery_app worker --loglevel=info --concurrency=2
+    environment:
+      DATABASE_URL: postgresql+asyncpg://admatrix:admatrix@postgres:5432/admatrix
+      REDIS_URL: redis://redis:6379/0
+      QWEN_API_KEY: ${QWEN_API_KEY:-}
+      VIDEO_OUTPUT_DIR: /tmp/admatrix/videos
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - video_output:/tmp/admatrix
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_DEMO_MODE: ${DEMO_MODE:-false}
+      NEXT_PUBLIC_API_KEY: ${API_KEY:-}
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  video_output:
