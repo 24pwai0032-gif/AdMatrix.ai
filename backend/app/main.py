@@ -66,7 +66,7 @@ async def request_logging_middleware(request: Request, call_next):
     response = await call_next(request)
     if request.url.path != "/health":
         rid = getattr(request.state, "request_id", "-")
-        logger.info("%s %s %s → %s", rid, request.method, request.url.path, response.status_code)
+        logger.info("%s %s %s -> %s", rid, request.method, request.url.path, response.status_code)
     return response
 
 

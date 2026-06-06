@@ -1,455 +1,731 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ArrowRight,
+  Check,
+  CheckCircle2,
+  Cpu,
+  Film,
+  Gauge,
+  Globe,
+  Link2,
+  Loader2,
+  Palette,
+  Pause,
+  Play,
+  RefreshCw,
+  ShieldCheck,
+  Sparkles,
+  Users,
+  Wand2,
+} from "lucide-react";
+import {
+  BUDGET_USD,
+  COST_LEDGER,
+  DEMO_PRODUCT,
+  LOCALES,
+  PIPELINE,
+  SAMPLE_URLS,
+  type Scene,
+  type StageKey,
+} from "@/lib/demo";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const DEMO_MODE = process.env.NEXT_PUBLIC_DEMO_MODE === "true";
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
+type Phase = "idle" | "running" | "awaiting_approval" | "done";
 
-function apiHeaders(): HeadersInit {
-  const headers: HeadersInit = { "Content-Type": "application/json" };
-  if (API_KEY) headers["X-API-Key"] = API_KEY;
-  return headers;
-}
-
-async function parseError(res: Response): Promise<string> {
-  try {
-    const body = await res.json();
-    return body.detail?.message || body.detail || `Request failed (${res.status})`;
-  } catch {
-    return `Request failed (${res.status})`;
-  }
-}
-
-const STATE_ORDER = [
-  "draft",
-  "ingesting",
-  "scripting",
-  "awaiting_approval",
-  "approved",
-  "rendering",
-  "compliance_check",
-  "completed",
-  "failed",
-  "cancelled",
-] as const;
-
-type CampaignState = (typeof STATE_ORDER)[number];
-
-interface Scene {
-  scene_id: string;
-  order: number;
-  narration: string;
-  visual_prompt: string;
-  duration_sec: number;
-  panel_image_url?: string;
-}
-
-interface Storyboard {
-  id: string;
-  locale: string;
-  scenes: Scene[];
-  narrative: string | null;
-  panel_images: string[];
-  hitl_status: string;
-}
-
-interface Campaign {
-  id: string;
-  state: CampaignState;
-  primary_locale: string;
-  target_locales: string[];
-  revision_count: number;
-  script_draft: { scenes?: Scene[] };
-}
-
-interface Metrics {
-  total_cost_usd: number;
-  budget_threshold_usd: number;
-  by_model: Record<string, { cost_usd: number; calls: number }>;
-}
-
-const DEMO_CAMPAIGN: Campaign = {
-  id: "demo-campaign-001",
-  state: "awaiting_approval",
-  primary_locale: "en-US",
-  target_locales: ["en-US", "zh-CN", "ja-JP"],
-  revision_count: 0,
-  script_draft: {
-    scenes: [
-      { scene_id: "s1", order: 0, narration: "Discover smart hydration.", visual_prompt: "Product hero shot", duration_sec: 3 },
-      { scene_id: "s2", order: 1, narration: "Track every sip.", visual_prompt: "App interface overlay", duration_sec: 3 },
-      { scene_id: "s3", order: 2, narration: "24-hour temperature lock.", visual_prompt: "Ice cubes close-up", duration_sec: 3 },
-      { scene_id: "s4", order: 3, narration: "Shop now — limited offer.", visual_prompt: "CTA end card", duration_sec: 3 },
-    ],
-  },
-};
-
-const DEMO_STORYBOARD: Storyboard = {
-  id: "demo-sb-001",
-  locale: "en-US",
-  scenes: DEMO_CAMPAIGN.script_draft.scenes!,
-  narrative: "Discover smart hydration. Track every sip. 24-hour temperature lock. Shop now.",
-  panel_images: ["/panel-1.jpg", "/panel-2.jpg", "/panel-3.jpg", "/panel-4.jpg"],
-  hitl_status: "pending",
+// How far costs have accrued, keyed by the stage we've reached.
+const COST_REVEAL: Partial<Record<StageKey, number>> = {
+  transcreation: 1,
+  storyboarding: 2,
+  video_rendering: 3,
+  lip_syncing: 4,
+  compliance_check: 4,
 };
 
 export default function DashboardPage() {
-  const [productUrl, setProductUrl] = useState("");
-  const [campaign, setCampaign] = useState<Campaign | null>(DEMO_MODE ? DEMO_CAMPAIGN : null);
-  const [storyboard, setStoryboard] = useState<Storyboard | null>(DEMO_MODE ? DEMO_STORYBOARD : null);
-  const [selectedLocale, setSelectedLocale] = useState("en-US");
-  const [metrics, setMetrics] = useState<Metrics | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [videoUrl, setVideoUrl] = useState<string | null>(null);
-  const [editedScenes, setEditedScenes] = useState<Scene[]>([]);
-  const complianceTriggered = useRef(false);
+  const [url, setUrl] = useState("");
+  const [locales, setLocales] = useState<string[]>(["en-US", "zh-CN", "ja-JP"]);
+  const [current, setCurrent] = useState(-1); // index into PIPELINE
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [approved, setApproved] = useState(false);
+  const [revision, setRevision] = useState(0);
+  const [scenes, setScenes] = useState<Scene[]>(DEMO_PRODUCT.scenes);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const fetchCampaign = useCallback(async (id: string) => {
-    if (DEMO_MODE) return;
-    const res = await fetch(`${API_BASE}/api/v1/campaigns/${id}`, { headers: apiHeaders() });
-    if (!res.ok) throw new Error(await parseError(res));
-    const data = await res.json();
-    setCampaign(data);
-  }, []);
+  const approvalIndex = PIPELINE.findIndex((s) => s.key === "awaiting_approval");
+  const storyboardIndex = PIPELINE.findIndex((s) => s.key === "storyboarding");
 
-  const fetchRenderStatus = useCallback(async (id: string) => {
-    if (DEMO_MODE) return;
-    try {
-      const res = await fetch(`${API_BASE}/api/v1/campaigns/${id}/render`, { headers: apiHeaders() });
-      if (!res.ok) return;
-      const data = await res.json();
-      if (data.status === "completed") {
-        const urlRes = await fetch(
-          `${API_BASE}/api/v1/campaigns/${id}/video-url?base_url=${encodeURIComponent(API_BASE)}`,
-          { headers: apiHeaders() },
-        );
-        if (urlRes.ok) {
-          const { video_url } = await urlRes.json();
-          setVideoUrl(video_url);
-        }
-        if (!complianceTriggered.current) {
-          complianceTriggered.current = true;
-          const complianceRes = await fetch(`${API_BASE}/api/v1/campaigns/${id}/compliance`, {
-            method: "POST",
-            headers: apiHeaders(),
-          });
-          if (complianceRes.ok) {
-            const campRes = await fetch(`${API_BASE}/api/v1/campaigns/${id}`, { headers: apiHeaders() });
-            if (campRes.ok) setCampaign(await campRes.json());
-          }
-        }
-      }
-    } catch {
-      /* render may not be started yet */
-    }
-  }, []);
+  // ---- Pipeline simulation engine -----------------------------------------
+  useEffect(() => {
+    if (current < 0 || phase === "done") return;
+    const stage = PIPELINE[current];
 
-  const fetchStoryboard = useCallback(async (id: string) => {
-    if (DEMO_MODE) return;
-    try {
-      const res = await fetch(`${API_BASE}/api/v1/campaigns/${id}/storyboard`, { headers: apiHeaders() });
-      if (res.ok) {
-        const data = await res.json();
-        setStoryboard(data);
-        setEditedScenes(data.scenes || []);
-      }
-    } catch {
-      /* storyboard may not exist yet */
-    }
-  }, []);
-
-  const fetchMetrics = useCallback(async (id?: string) => {
-    if (DEMO_MODE) {
-      setMetrics({ total_cost_usd: 2.45, budget_threshold_usd: 10, by_model: { "qwen3.6-plus": { cost_usd: 1.2, calls: 8 } } });
+    if (stage.key === "awaiting_approval" && !approved) {
+      setPhase("awaiting_approval");
       return;
     }
-    const url = id ? `${API_BASE}/api/v1/metrics?campaign_id=${id}` : `${API_BASE}/api/v1/metrics`;
-    const res = await fetch(url, { headers: apiHeaders() });
-    if (res.ok) setMetrics(await res.json());
+    setPhase("running");
+
+    const advance = () => {
+      if (current >= PIPELINE.length - 1) {
+        setPhase("done");
+      } else {
+        setCurrent((c) => c + 1);
+      }
+    };
+
+    const delay = stage.key === "awaiting_approval" ? 250 : stage.duration;
+    timer.current = setTimeout(advance, delay);
+    return () => {
+      if (timer.current) clearTimeout(timer.current);
+    };
+  }, [current, approved, phase]);
+
+  const start = useCallback(() => {
+    setScenes(DEMO_PRODUCT.scenes);
+    setApproved(false);
+    setRevision(0);
+    setPhase("running");
+    setCurrent(0);
   }, []);
 
-  useEffect(() => {
-    if (!campaign?.id || DEMO_MODE) return;
-    const interval = setInterval(() => {
-      fetchCampaign(campaign.id);
-      fetchStoryboard(campaign.id);
-      fetchMetrics(campaign.id);
-      if (campaign.state === "rendering" || campaign.state === "approved") {
-        fetchRenderStatus(campaign.id);
-      }
-    }, 4000);
-    return () => clearInterval(interval);
-  }, [campaign?.id, campaign?.state, fetchCampaign, fetchStoryboard, fetchMetrics, fetchRenderStatus]);
+  const approve = useCallback(() => {
+    setApproved(true);
+    setCurrent((c) => c + 1);
+  }, []);
 
-  useEffect(() => {
-    if (storyboard?.scenes) setEditedScenes(storyboard.scenes);
-  }, [storyboard]);
+  const requestRevision = useCallback(() => {
+    setRevision((r) => r + 1);
+    setApproved(false);
+    setCurrent(storyboardIndex);
+  }, [storyboardIndex]);
 
-  async function handleIngest() {
-    setLoading(true);
-    setError(null);
-    try {
-      if (DEMO_MODE) {
-        setCampaign(DEMO_CAMPAIGN);
-        setStoryboard(DEMO_STORYBOARD);
-        setEditedScenes(DEMO_STORYBOARD.scenes);
-        await fetchMetrics();
-        return;
-      }
+  const reset = useCallback(() => {
+    if (timer.current) clearTimeout(timer.current);
+    setCurrent(-1);
+    setPhase("idle");
+    setApproved(false);
+    setRevision(0);
+  }, []);
 
-      const ingestRes = await fetch(`${API_BASE}/api/v1/ingest`, {
-        method: "POST",
-        headers: apiHeaders(),
-        body: JSON.stringify({ source_url: productUrl }),
-      });
-      if (!ingestRes.ok) throw new Error(await parseError(ingestRes));
-      const product = await ingestRes.json();
+  const updateNarration = (idx: number, locale: string, text: string) =>
+    setScenes((prev) =>
+      prev.map((s, i) => (i === idx ? { ...s, narration: { ...s.narration, [locale]: text } } : s)),
+    );
 
-      const campRes = await fetch(`${API_BASE}/api/v1/campaigns`, {
-        method: "POST",
-        headers: apiHeaders(),
-        body: JSON.stringify({
-          product_id: product.id,
-          target_locales: ["en-US", "zh-CN", "ja-JP"],
-        }),
-      });
-      if (!campRes.ok) throw new Error(await parseError(campRes));
-      const camp = await campRes.json();
-      setCampaign(camp);
+  const toggleLocale = (code: string) =>
+    setLocales((prev) =>
+      prev.includes(code) ? prev.filter((c) => c !== code) : [...prev, code],
+    );
 
-      const scriptRes = await fetch(`${API_BASE}/api/v1/campaigns/${camp.id}/script`, {
-        method: "POST",
-        headers: apiHeaders(),
-      });
-      if (!scriptRes.ok) throw new Error(await parseError(scriptRes));
-      await fetchCampaign(camp.id);
-      await fetchStoryboard(camp.id);
-      await fetchMetrics(camp.id);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
-    } finally {
-      setLoading(false);
-    }
-  }
+  // ---- Derived view state --------------------------------------------------
+  const reachedKey: StageKey | undefined = current >= 0 ? PIPELINE[current].key : undefined;
+  const revealCount = reachedKey ? COST_REVEAL[reachedKey] ?? 0 : 0;
+  const ledger = phase === "done" ? COST_LEDGER : COST_LEDGER.slice(0, revealCount);
+  const totalCost = ledger.reduce((sum, m) => sum + m.cost, 0);
+  const utilization = Math.min(100, (totalCost / BUDGET_USD) * 100);
 
-  async function handleApproval(action: "APPROVE" | "REJECT") {
-    if (!campaign) return;
-    setLoading(true);
-    try {
-      if (DEMO_MODE) {
-        if (action === "APPROVE") {
-          setCampaign({ ...campaign, state: "approved" });
-          setVideoUrl("/demo-video.mp4");
-        }
-        return;
-      }
-      const res = await fetch(`${API_BASE}/api/v1/campaigns/${campaign.id}/approve`, {
-        method: "POST",
-        headers: apiHeaders(),
-        body: JSON.stringify({ action }),
-      });
-      if (!res.ok) throw new Error(await parseError(res));
-      if (action === "APPROVE") {
-        const renderRes = await fetch(`${API_BASE}/api/v1/campaigns/${campaign.id}/render`, {
-          method: "POST",
-          headers: apiHeaders(),
-        });
-        if (!renderRes.ok) throw new Error(await parseError(renderRes));
-      }
-      await fetchCampaign(campaign.id);
-      await fetchStoryboard(campaign.id);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function updateSceneNarration(index: number, narration: string) {
-    setEditedScenes((prev) => prev.map((s, i) => (i === index ? { ...s, narration } : s)));
-  }
-
-  const currentState = campaign?.state ?? "draft";
-  const stateIndex = STATE_ORDER.indexOf(currentState);
+  const showStoryboard = phase === "awaiting_approval";
+  const showVideo = phase === "done";
+  const activeLocales = LOCALES.filter((l) => locales.includes(l.code));
 
   return (
-    <div style={styles.page}>
-      <header style={styles.header}>
-        <h1 style={styles.title}>AdMatrix.ai</h1>
-        <p style={styles.subtitle}>AI-Powered Multilingual Video Ad Production</p>
-        {DEMO_MODE && <span style={styles.demoBadge}>DEMO MODE</span>}
-      </header>
+    <div className="min-h-screen bg-grid">
+      <NavBar onReset={reset} canReset={current >= 0} />
 
-      {/* Ingest */}
-      <section style={styles.card}>
-        <h2 style={styles.cardTitle}>Product Ingest</h2>
-        <div style={styles.row}>
-          <input
-            type="url"
-            placeholder="https://example.com/product"
-            value={productUrl}
-            onChange={(e) => setProductUrl(e.target.value)}
-            style={styles.input}
+      <main className="mx-auto max-w-5xl px-4 pb-24 pt-8 sm:px-6">
+        <Hero />
+
+        <IngestCard
+          url={url}
+          setUrl={setUrl}
+          locales={locales}
+          toggleLocale={toggleLocale}
+          onStart={start}
+          running={current >= 0 && phase !== "done"}
+        />
+
+        {current >= 0 && (
+          <>
+            <Stepper current={current} phase={phase} revision={revision} />
+            <BrandBookCard />
+          </>
+        )}
+
+        {showStoryboard && (
+          <StoryboardCard
+            scenes={scenes}
+            locales={activeLocales}
+            onApprove={approve}
+            onRevise={requestRevision}
+            revision={revision}
+            onEdit={updateNarration}
           />
-          <button onClick={handleIngest} disabled={loading || (!productUrl && !DEMO_MODE)} style={styles.primaryBtn}>
-            {loading ? "Processing…" : "Ingest & Generate"}
-          </button>
-        </div>
-        {error && <p style={styles.error}>{error}</p>}
-      </section>
+        )}
 
-      {/* Status Timeline */}
-      {campaign && (
-        <section style={styles.card}>
-          <h2 style={styles.cardTitle}>Campaign Status</h2>
-          <div style={styles.timeline}>
-            {STATE_ORDER.slice(0, 8).map((state, i) => (
-              <div key={state} style={styles.timelineStep}>
-                <div
-                  style={{
-                    ...styles.timelineDot,
-                    background: i <= stateIndex ? "#e94560" : "#2a2a4a",
-                    boxShadow: i === stateIndex ? "0 0 12px #e94560" : "none",
-                  }}
-                />
-                <span style={{ ...styles.timelineLabel, opacity: i <= stateIndex ? 1 : 0.4 }}>
-                  {state.replace(/_/g, " ")}
-                </span>
-              </div>
-            ))}
-          </div>
-          <p style={styles.meta}>
-            Campaign: {campaign.id.slice(0, 8)}… · Revision {campaign.revision_count}
-          </p>
-        </section>
-      )}
+        {current >= 0 && (
+          <MetricsCard ledger={ledger} totalCost={totalCost} utilization={utilization} />
+        )}
 
-      {/* Metrics Widget */}
-      {metrics && (
-        <section style={styles.card}>
-          <h2 style={styles.cardTitle}>Token Usage</h2>
-          <div style={styles.metricsRow}>
-            <div style={styles.metric}>
-              <span style={styles.metricValue}>${metrics.total_cost_usd.toFixed(2)}</span>
-              <span style={styles.metricLabel}>Total Spend</span>
-            </div>
-            <div style={styles.metric}>
-              <span style={styles.metricValue}>${metrics.budget_threshold_usd}</span>
-              <span style={styles.metricLabel}>Budget Cap</span>
-            </div>
-            <div style={styles.metric}>
-              <span style={styles.metricValue}>
-                {((metrics.total_cost_usd / metrics.budget_threshold_usd) * 100).toFixed(0)}%
-              </span>
-              <span style={styles.metricLabel}>Utilization</span>
-            </div>
-          </div>
-        </section>
-      )}
-
-      {/* HITL Storyboard Approval */}
-      {storyboard && campaign?.state === "awaiting_approval" && (
-        <section style={styles.card}>
-          <h2 style={styles.cardTitle}>Storyboard Approval</h2>
-          <div style={styles.panelGrid}>
-            {(storyboard.panel_images.length ? storyboard.panel_images : editedScenes).slice(0, 4).map((panel, i) => (
-              <div key={i} style={styles.panel}>
-                <div style={styles.panelImage}>
-                  {typeof panel === "string" ? `Panel ${i + 1}` : `Scene ${i + 1}`}
-                </div>
-                <textarea
-                  value={editedScenes[i]?.narration || ""}
-                  onChange={(e) => updateSceneNarration(i, e.target.value)}
-                  style={styles.narrativeEditor}
-                  rows={3}
-                />
-              </div>
-            ))}
-          </div>
-          <p style={styles.narrative}>{storyboard.narrative}</p>
-          <div style={styles.row}>
-            <button onClick={() => handleApproval("APPROVE")} disabled={loading} style={styles.approveBtn}>
-              Approve & Render
-            </button>
-            <button onClick={() => handleApproval("REJECT")} disabled={loading} style={styles.rejectBtn}>
-              Request Revision
-            </button>
-          </div>
-        </section>
-      )}
-
-      {/* Video Player + Locale Selector */}
-      {(campaign?.state === "rendering" || campaign?.state === "compliance_check" || campaign?.state === "completed" || campaign?.state === "failed" || campaign?.state === "approved" || videoUrl) && (
-        <section style={styles.card}>
-          <h2 style={styles.cardTitle}>Video Output</h2>
-          <div style={styles.row}>
-            <label style={styles.localeLabel}>Language:</label>
-            <select
-              value={selectedLocale}
-              onChange={(e) => setSelectedLocale(e.target.value)}
-              style={styles.select}
-            >
-              {(campaign?.target_locales || ["en-US"]).map((l) => (
-                <option key={l} value={l}>{l}</option>
-              ))}
-            </select>
-          </div>
-          <div style={styles.videoContainer}>
-            {videoUrl ? (
-              <video src={videoUrl} controls style={styles.video} />
-            ) : (
-              <div style={styles.videoPlaceholder}>
-                <p>Rendering 9:16 video for {selectedLocale}…</p>
-                <div style={styles.spinner} />
-              </div>
-            )}
-          </div>
-        </section>
-      )}
+        {showVideo && <VideoCard scenes={scenes} locales={activeLocales} />}
+      </main>
     </div>
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  page: {
-    minHeight: "100vh",
-    background: "linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%)",
-    color: "#e8e8f0",
-    padding: "2rem",
-    fontFamily: "'Inter', system-ui, sans-serif",
-  },
-  header: { textAlign: "center", marginBottom: "2rem", position: "relative" },
-  title: { fontSize: "2.5rem", fontWeight: 700, margin: 0, background: "linear-gradient(90deg, #e94560, #ff6b8a)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" },
-  subtitle: { color: "#8888aa", marginTop: "0.5rem" },
-  demoBadge: { position: "absolute", top: 0, right: 0, background: "#e94560", padding: "4px 12px", borderRadius: 12, fontSize: 12, fontWeight: 600 },
-  card: { background: "rgba(255,255,255,0.04)", borderRadius: 16, padding: "1.5rem", marginBottom: "1.5rem", border: "1px solid rgba(255,255,255,0.08)" },
-  cardTitle: { fontSize: "1.1rem", fontWeight: 600, marginBottom: "1rem", color: "#ccc" },
-  row: { display: "flex", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" },
-  input: { flex: 1, minWidth: 280, padding: "0.75rem 1rem", borderRadius: 10, border: "1px solid #333", background: "#12121f", color: "#fff", fontSize: 14 },
-  primaryBtn: { padding: "0.75rem 1.5rem", borderRadius: 10, border: "none", background: "#e94560", color: "#fff", fontWeight: 600, cursor: "pointer" },
-  approveBtn: { padding: "0.75rem 1.5rem", borderRadius: 10, border: "none", background: "#22c55e", color: "#fff", fontWeight: 600, cursor: "pointer" },
-  rejectBtn: { padding: "0.75rem 1.5rem", borderRadius: 10, border: "none", background: "transparent", color: "#e94560", fontWeight: 600, cursor: "pointer", borderWidth: 1, borderStyle: "solid", borderColor: "#e94560" },
-  error: { color: "#ef4444", marginTop: "0.5rem" },
-  timeline: { display: "flex", gap: "0.5rem", overflowX: "auto", paddingBottom: "0.5rem" },
-  timelineStep: { display: "flex", flexDirection: "column", alignItems: "center", minWidth: 80 },
-  timelineDot: { width: 12, height: 12, borderRadius: "50%", marginBottom: 6 },
-  timelineLabel: { fontSize: 10, textTransform: "capitalize", textAlign: "center" },
-  meta: { fontSize: 12, color: "#666", marginTop: "0.75rem" },
-  metricsRow: { display: "flex", gap: "2rem" },
-  metric: { display: "flex", flexDirection: "column" },
-  metricValue: { fontSize: "1.5rem", fontWeight: 700, color: "#e94560" },
-  metricLabel: { fontSize: 12, color: "#888" },
-  panelGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "1rem" },
-  panel: { display: "flex", flexDirection: "column", gap: "0.5rem" },
-  panelImage: { aspectRatio: "9/16", background: "#1a1a2e", borderRadius: 12, display: "flex", alignItems: "center", justifyContent: "center", color: "#555", border: "1px solid #333" },
-  narrativeEditor: { width: "100%", padding: "0.5rem", borderRadius: 8, border: "1px solid #333", background: "#12121f", color: "#fff", fontSize: 13, resize: "vertical" },
-  narrative: { fontSize: 14, color: "#aaa", margin: "1rem 0" },
-  localeLabel: { fontSize: 14, color: "#aaa" },
-  select: { padding: "0.5rem 1rem", borderRadius: 8, border: "1px solid #333", background: "#12121f", color: "#fff" },
-  videoContainer: { marginTop: "1rem", borderRadius: 16, overflow: "hidden", background: "#000" },
-  video: { width: "100%", maxWidth: 360, margin: "0 auto", display: "block" },
-  videoPlaceholder: { padding: "4rem", textAlign: "center", color: "#666" },
-  spinner: { width: 40, height: 40, border: "3px solid #333", borderTopColor: "#e94560", borderRadius: "50%", margin: "1rem auto", animation: "spin 1s linear infinite" },
-};
+/* ----------------------------------------------------------------------- */
+/* Layout pieces                                                            */
+/* ----------------------------------------------------------------------- */
+
+function NavBar({ onReset, canReset }: { onReset: () => void; canReset: boolean }) {
+  return (
+    <header className="sticky top-0 z-30 border-b border-slate-200/70 bg-white/80 backdrop-blur">
+      <div className="mx-auto flex max-w-5xl items-center justify-between px-4 py-3 sm:px-6">
+        <div className="flex items-center gap-2.5">
+          <div className="grid h-9 w-9 place-items-center rounded-xl bg-gradient-to-br from-brand-500 to-violet-500 text-white shadow-ring">
+            <Sparkles className="h-5 w-5" />
+          </div>
+          <div className="leading-tight">
+            <p className="text-[15px] font-bold tracking-tight text-slate-900">AdMatrix.ai</p>
+            <p className="text-[11px] text-slate-500">Localized video ads, automatically</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="hidden items-center gap-1.5 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-medium text-slate-600 sm:inline-flex">
+            <Cpu className="h-3.5 w-3.5 text-brand-500" /> Powered by Qwen Cloud
+          </span>
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700 ring-1 ring-emerald-600/20">
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> Demo
+          </span>
+          {canReset && (
+            <button
+              onClick={onReset}
+              className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-600 transition hover:bg-slate-50"
+            >
+              <RefreshCw className="h-3.5 w-3.5" /> Reset
+            </button>
+          )}
+        </div>
+      </div>
+    </header>
+  );
+}
+
+function Hero() {
+  return (
+    <div className="mb-8 animate-fade-up text-center">
+      <span className="inline-flex items-center gap-1.5 rounded-full border border-brand-200 bg-brand-50 px-3 py-1 text-xs font-semibold text-brand-700">
+        <Wand2 className="h-3.5 w-3.5" /> Multi-agent creative pipeline
+      </span>
+      <h1 className="mt-4 text-3xl font-extrabold tracking-tight text-slate-900 sm:text-4xl">
+        Turn a product URL into a{" "}
+        <span className="bg-gradient-to-r from-brand-600 to-violet-500 bg-clip-text text-transparent">
+          localized video ad
+        </span>
+      </h1>
+      <p className="mx-auto mt-3 max-w-xl text-[15px] leading-relaxed text-slate-500">
+        Paste a link. Agents scrape the page, transcreate your script per dialect, storyboard the
+        scenes, and render a lip-synced 9:16 ad — you just approve the storyboard.
+      </p>
+    </div>
+  );
+}
+
+function Card({
+  title,
+  icon,
+  children,
+  accent,
+}: {
+  title: string;
+  icon: React.ReactNode;
+  children: React.ReactNode;
+  accent?: string;
+}) {
+  return (
+    <section className="mb-5 animate-fade-up rounded-2xl border border-slate-200 bg-white p-5 shadow-card sm:p-6">
+      <div className="mb-4 flex items-center gap-2.5">
+        <span className={`grid h-8 w-8 place-items-center rounded-lg ${accent ?? "bg-brand-50 text-brand-600"}`}>
+          {icon}
+        </span>
+        <h2 className="text-[15px] font-semibold text-slate-900">{title}</h2>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function IngestCard({
+  url,
+  setUrl,
+  locales,
+  toggleLocale,
+  onStart,
+  running,
+}: {
+  url: string;
+  setUrl: (v: string) => void;
+  locales: string[];
+  toggleLocale: (c: string) => void;
+  onStart: () => void;
+  running: boolean;
+}) {
+  return (
+    <Card title="Product ingest" icon={<Link2 className="h-4.5 w-4.5" />}>
+      <div className="flex flex-col gap-2.5 sm:flex-row">
+        <div className="relative flex-1">
+          <Link2 className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <input
+            type="url"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://store.example.com/your-product"
+            className="w-full rounded-xl border border-slate-200 bg-slate-50 py-3 pl-9 pr-3 text-sm text-slate-900 outline-none transition focus:border-brand-400 focus:bg-white focus:ring-4 focus:ring-brand-100"
+          />
+        </div>
+        <button
+          onClick={onStart}
+          disabled={running}
+          className="inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-brand-600 to-violet-500 px-5 py-3 text-sm font-semibold text-white shadow-ring transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {running ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+          {running ? "Generating…" : "Generate ad"}
+        </button>
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-1.5">
+        <span className="text-xs text-slate-400">Try:</span>
+        {SAMPLE_URLS.map((s) => (
+          <button
+            key={s}
+            onClick={() => setUrl(s)}
+            className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs text-slate-600 transition hover:border-brand-300 hover:text-brand-600"
+          >
+            {s.replace("https://", "")}
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-4">
+        <p className="mb-2 text-xs font-medium text-slate-500">Target locales</p>
+        <div className="flex flex-wrap gap-2">
+          {LOCALES.map((l) => {
+            const on = locales.includes(l.code);
+            return (
+              <button
+                key={l.code}
+                onClick={() => toggleLocale(l.code)}
+                className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                  on
+                    ? "border-brand-300 bg-brand-50 text-brand-700"
+                    : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+                }`}
+              >
+                <span>{l.flag}</span>
+                {l.label}
+                {on && <Check className="h-3.5 w-3.5" />}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function Stepper({
+  current,
+  phase,
+  revision,
+}: {
+  current: number;
+  phase: Phase;
+  revision: number;
+}) {
+  return (
+    <Card
+      title="Pipeline"
+      icon={<Gauge className="h-4.5 w-4.5" />}
+      accent="bg-violet-50 text-violet-600"
+    >
+      <div className="flex gap-2 overflow-x-auto pb-1">
+        {PIPELINE.map((stage, i) => {
+          const done = phase === "done" || i < current;
+          const active = i === current && phase !== "done";
+          return (
+            <div key={stage.key} className="flex min-w-[112px] flex-1 flex-col items-center">
+              <div className="flex w-full items-center">
+                <span
+                  className={`grid h-8 w-8 shrink-0 place-items-center rounded-full text-xs font-bold transition ${
+                    done
+                      ? "bg-emerald-500 text-white"
+                      : active
+                        ? "animate-pulse-ring bg-brand-600 text-white"
+                        : "bg-slate-100 text-slate-400"
+                  }`}
+                >
+                  {done ? <Check className="h-4 w-4" /> : i + 1}
+                </span>
+                {i < PIPELINE.length - 1 && (
+                  <span
+                    className={`mx-1 h-0.5 flex-1 rounded ${i < current || phase === "done" ? "bg-emerald-400" : "bg-slate-200"}`}
+                  />
+                )}
+              </div>
+              <p
+                className={`mt-2 text-center text-[11px] font-semibold ${
+                  active ? "text-brand-700" : done ? "text-slate-700" : "text-slate-400"
+                }`}
+              >
+                {stage.label}
+              </p>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="mt-4 flex items-center justify-between rounded-xl bg-slate-50 px-4 py-3">
+        <div className="flex items-center gap-2.5">
+          {phase === "done" ? (
+            <CheckCircle2 className="h-5 w-5 text-emerald-500" />
+          ) : phase === "awaiting_approval" ? (
+            <Pause className="h-5 w-5 text-amber-500" />
+          ) : (
+            <Loader2 className="h-5 w-5 animate-spin text-brand-500" />
+          )}
+          <p className="text-sm text-slate-600">
+            {phase === "done"
+              ? "Ad rendered & compliance-passed."
+              : current >= 0
+                ? PIPELINE[current].detail
+                : ""}
+          </p>
+        </div>
+        {revision > 0 && (
+          <span className="rounded-full bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-700">
+            Revision {revision}
+          </span>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+function BrandBookCard() {
+  const { brand } = DEMO_PRODUCT;
+  const items = [
+    { icon: <Sparkles className="h-4 w-4" />, label: "Product", value: brand.productName },
+    { icon: <Wand2 className="h-4 w-4" />, label: "Tone", value: brand.tone },
+    { icon: <Users className="h-4 w-4" />, label: "Audience", value: brand.audience },
+  ];
+  return (
+    <Card
+      title="Extracted brand book"
+      icon={<Palette className="h-4.5 w-4.5" />}
+      accent="bg-rose-50 text-rose-500"
+    >
+      <div className="grid gap-3 sm:grid-cols-3">
+        {items.map((it) => (
+          <div key={it.label} className="rounded-xl border border-slate-100 bg-slate-50/60 p-3">
+            <div className="mb-1 flex items-center gap-1.5 text-slate-400">
+              {it.icon}
+              <span className="text-[11px] font-semibold uppercase tracking-wide">{it.label}</span>
+            </div>
+            <p className="text-sm font-medium text-slate-800">{it.value}</p>
+          </div>
+        ))}
+      </div>
+      <div className="mt-3 flex items-center gap-2">
+        <span className="text-xs font-medium text-slate-500">Palette</span>
+        {brand.colors.map((c) => (
+          <span
+            key={c}
+            className="h-6 w-6 rounded-md ring-1 ring-black/5"
+            style={{ backgroundColor: c }}
+            title={c}
+          />
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function StoryboardCard({
+  scenes,
+  locales,
+  onApprove,
+  onRevise,
+  revision,
+  onEdit,
+}: {
+  scenes: Scene[];
+  locales: { code: string; label: string; flag: string }[];
+  onApprove: () => void;
+  onRevise: () => void;
+  revision: number;
+  onEdit: (idx: number, locale: string, text: string) => void;
+}) {
+  const editLocale = locales[0]?.code ?? "en-US";
+  return (
+    <Card
+      title="Storyboard approval"
+      icon={<Film className="h-4.5 w-4.5" />}
+      accent="bg-amber-50 text-amber-600"
+    >
+      <p className="mb-4 text-sm text-slate-500">
+        Human-in-the-loop checkpoint — review the {scenes.length} generated panels and tweak any
+        narration before rendering.
+      </p>
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        {scenes.map((s, i) => (
+          <div key={s.id} className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+            <div className={`relative aspect-[9/16] bg-gradient-to-br ${s.gradient}`}>
+              <span className="absolute left-2 top-2 rounded-md bg-black/25 px-1.5 py-0.5 text-[10px] font-bold text-white backdrop-blur">
+                Scene {i + 1}
+              </span>
+              <span className="absolute bottom-2 right-2 rounded-md bg-black/25 px-1.5 py-0.5 text-[10px] font-semibold text-white backdrop-blur">
+                {s.durationSec}s
+              </span>
+              <div className="absolute inset-0 flex items-end p-3">
+                <p className="text-[11px] font-medium leading-snug text-white/90 drop-shadow">
+                  {s.visualPrompt}
+                </p>
+              </div>
+            </div>
+            <div className="p-2">
+              <textarea
+                value={s.narration[editLocale] ?? ""}
+                onChange={(e) => onEdit(i, editLocale, e.target.value)}
+                rows={2}
+                className="w-full resize-none rounded-lg border border-slate-200 bg-slate-50 p-2 text-xs text-slate-700 outline-none transition focus:border-brand-400 focus:bg-white focus:ring-2 focus:ring-brand-100"
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="mt-5 flex flex-wrap items-center gap-3">
+        <button
+          onClick={onApprove}
+          className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-600"
+        >
+          <Check className="h-4 w-4" /> Approve & render
+        </button>
+        <button
+          onClick={onRevise}
+          className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-5 py-2.5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50"
+        >
+          <RefreshCw className="h-4 w-4" /> Request revision
+        </button>
+        <span className="text-xs text-slate-400">
+          Editing narration for {locales[0]?.flag} {editLocale}
+          {revision > 0 ? ` · revision ${revision}` : ""}
+        </span>
+      </div>
+    </Card>
+  );
+}
+
+function MetricsCard({
+  ledger,
+  totalCost,
+  utilization,
+}: {
+  ledger: { model: string; calls: number; cost: number }[];
+  totalCost: number;
+  utilization: number;
+}) {
+  const over = utilization >= 80;
+  return (
+    <Card
+      title="Token usage & budget"
+      icon={<Gauge className="h-4.5 w-4.5" />}
+      accent="bg-emerald-50 text-emerald-600"
+    >
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Stat label="Total spend" value={`$${totalCost.toFixed(2)}`} />
+        <Stat label="Budget cap" value={`$${BUDGET_USD.toFixed(2)}`} />
+        <Stat
+          label="Utilization"
+          value={`${utilization.toFixed(0)}%`}
+          tone={over ? "warn" : "ok"}
+        />
+      </div>
+
+      <div className="mt-4 h-2.5 w-full overflow-hidden rounded-full bg-slate-100">
+        <div
+          className={`h-full rounded-full transition-all duration-700 ${over ? "bg-amber-500" : "bg-gradient-to-r from-brand-500 to-emerald-500"}`}
+          style={{ width: `${Math.max(2, utilization)}%` }}
+        />
+      </div>
+
+      <div className="mt-4 space-y-1.5">
+        {ledger.length === 0 && (
+          <p className="text-xs text-slate-400">Metering will populate as agents run…</p>
+        )}
+        {ledger.map((m) => (
+          <div
+            key={m.model}
+            className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-2 text-xs"
+          >
+            <span className="flex items-center gap-2 font-medium text-slate-700">
+              <Cpu className="h-3.5 w-3.5 text-brand-500" /> {m.model}
+            </span>
+            <span className="text-slate-400">
+              {m.calls} calls · <span className="font-semibold text-slate-700">${m.cost.toFixed(2)}</span>
+            </span>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function Stat({ label, value, tone }: { label: string; value: string; tone?: "ok" | "warn" }) {
+  return (
+    <div className="rounded-xl border border-slate-100 bg-slate-50/60 p-3">
+      <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{label}</p>
+      <p
+        className={`mt-0.5 text-2xl font-bold ${
+          tone === "warn" ? "text-amber-600" : tone === "ok" ? "text-emerald-600" : "text-slate-900"
+        }`}
+      >
+        {value}
+      </p>
+    </div>
+  );
+}
+
+function VideoCard({
+  scenes,
+  locales,
+}: {
+  scenes: Scene[];
+  locales: { code: string; label: string; flag: string }[];
+}) {
+  const [locale, setLocale] = useState(locales[0]?.code ?? "en-US");
+  const [playing, setPlaying] = useState(true);
+  const [sceneIdx, setSceneIdx] = useState(0);
+  const [progress, setProgress] = useState(0);
+
+  // Keep selected locale valid if the active set changes.
+  useEffect(() => {
+    if (!locales.some((l) => l.code === locale)) setLocale(locales[0]?.code ?? "en-US");
+  }, [locales, locale]);
+
+  // Drive playback: advance a 0→100 progress bar, hop scenes when full.
+  useEffect(() => {
+    if (!playing) return;
+    const tick = 50;
+    const step = (100 * tick) / (scenes[sceneIdx].durationSec * 1000);
+    const id = setInterval(() => {
+      setProgress((p) => {
+        if (p + step >= 100) {
+          setSceneIdx((s) => (s + 1) % scenes.length);
+          return 0;
+        }
+        return p + step;
+      });
+    }, tick);
+    return () => clearInterval(id);
+  }, [playing, sceneIdx, scenes]);
+
+  const scene = scenes[sceneIdx];
+
+  return (
+    <Card
+      title="Rendered ad"
+      icon={<Film className="h-4.5 w-4.5" />}
+      accent="bg-brand-50 text-brand-600"
+    >
+      <div className="flex flex-col items-center gap-5 sm:flex-row sm:items-start">
+        {/* 9:16 player */}
+        <div className="relative w-full max-w-[240px] shrink-0 overflow-hidden rounded-2xl bg-black shadow-cardhover">
+          <div className={`relative aspect-[9/16] bg-gradient-to-br ${scene.gradient} transition-colors duration-500`}>
+            <div className="absolute inset-0 flex flex-col items-center justify-center px-5 text-center">
+              <p className="text-lg font-bold leading-snug text-white drop-shadow-lg">
+                {scene.narration[locale] ?? scene.narration["en-US"]}
+              </p>
+            </div>
+            <div className="absolute left-3 top-3 flex items-center gap-1 rounded-full bg-black/30 px-2 py-0.5 text-[10px] font-semibold text-white backdrop-blur">
+              <ShieldCheck className="h-3 w-3 text-emerald-300" /> Compliance ✓
+            </div>
+            <span className="absolute bottom-3 right-3 rounded-md bg-black/30 px-1.5 py-0.5 text-[10px] font-semibold text-white backdrop-blur">
+              {sceneIdx + 1}/{scenes.length}
+            </span>
+            {/* scene segment progress */}
+            <div className="absolute inset-x-3 bottom-3 flex gap-1">
+              {scenes.map((_, i) => (
+                <span key={i} className="h-1 flex-1 overflow-hidden rounded-full bg-white/30">
+                  <span
+                    className="block h-full rounded-full bg-white"
+                    style={{ width: i < sceneIdx ? "100%" : i === sceneIdx ? `${progress}%` : "0%" }}
+                  />
+                </span>
+              ))}
+            </div>
+          </div>
+          <button
+            onClick={() => setPlaying((p) => !p)}
+            className="absolute inset-0 grid place-items-center opacity-0 transition hover:opacity-100"
+          >
+            <span className="grid h-12 w-12 place-items-center rounded-full bg-white/90 text-brand-700 shadow-lg">
+              {playing ? <Pause className="h-5 w-5" /> : <Play className="h-5 w-5 translate-x-0.5" />}
+            </span>
+          </button>
+        </div>
+
+        {/* controls / details */}
+        <div className="w-full flex-1">
+          <div className="mb-4">
+            <p className="mb-2 flex items-center gap-1.5 text-xs font-medium text-slate-500">
+              <Globe className="h-3.5 w-3.5" /> Language
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {locales.map((l) => (
+                <button
+                  key={l.code}
+                  onClick={() => {
+                    setLocale(l.code);
+                    setSceneIdx(0);
+                    setProgress(0);
+                  }}
+                  className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                    locale === l.code
+                      ? "border-brand-300 bg-brand-50 text-brand-700"
+                      : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+                  }`}
+                >
+                  <span>{l.flag}</span>
+                  {l.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            {scenes.map((s, i) => (
+              <div
+                key={s.id}
+                className={`flex items-center gap-2 rounded-lg px-3 py-2 text-xs transition ${
+                  i === sceneIdx ? "bg-brand-50 text-brand-800" : "text-slate-500"
+                }`}
+              >
+                <span className={`h-2 w-2 shrink-0 rounded-full ${i === sceneIdx ? "bg-brand-500" : "bg-slate-300"}`} />
+                <span className="font-medium">{s.narration[locale] ?? s.narration["en-US"]}</span>
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800">
+              <ArrowRight className="h-4 w-4" /> Export MP4
+            </button>
+            <span className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-700">
+              <CheckCircle2 className="h-4 w-4" /> 9:16 · {scenes.reduce((s, x) => s + x.durationSec, 0)}s · {locale}
+            </span>
+          </div>
+        </div>
+      </div>
+    </Card>
+  );
+}
