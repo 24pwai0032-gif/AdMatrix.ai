@@ -27,7 +27,8 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     validate_production_config()
-    await init_db()
+    if not settings.demo_mode:
+        await init_db()
     logger.info(
         "AdMatrix.ai API started env=%s demo_mode=%s",
         settings.environment,

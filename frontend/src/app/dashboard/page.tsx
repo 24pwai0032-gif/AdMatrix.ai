@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ArrowRight,
   Check,
   CheckCircle2,
@@ -19,6 +20,7 @@ import {
   Sparkles,
   Users,
   Wand2,
+  X,
 } from "lucide-react";
 import {
   BUDGET_USD,
@@ -31,8 +33,26 @@ import {
   type Scene,
   type StageKey,
 } from "@/lib/demo";
+import {
+  ApiError,
+  approveCampaign,
+  createCampaign,
+  getStoryboard,
+  getVideoUrl,
+  ingestProduct,
+  mapBrandBook,
+  mapScene,
+  pollCampaignState,
+  pollRenderStatus,
+  runScript,
+  startRender,
+} from "@/lib/api";
 
-type Phase = "idle" | "running" | "awaiting_approval" | "done";
+/** true  → browser simulation (no backend needed)
+ *  false → real API calls to http://localhost:8000 */
+const IS_DEMO_MODE = process.env.NEXT_PUBLIC_DEMO_MODE === "true";
+
+type Phase = "idle" | "running" | "awaiting_approval" | "done" | "error";
 
 // How far costs have accrued, keyed by the stage we've reached.
 const COST_REVEAL: Partial<Record<StageKey, number>> = {
@@ -52,6 +72,10 @@ export default function DashboardPage() {
   const [revision, setRevision] = useState(0);
   const [scenes, setScenes] = useState<Scene[]>(DEMO_PRODUCT.scenes);
   const [brand, setBrand] = useState(DEMO_PRODUCT.brand);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  // Holds the live campaign ID when running in live mode
+  const campaignIdRef = useRef<string | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const approvalIndex = PIPELINE.findIndex((s) => s.key === "awaiting_approval");
@@ -83,27 +107,169 @@ export default function DashboardPage() {
     };
   }, [current, approved, phase]);
 
-  const start = () => {
-  // Load the correct product data for the selected URL
-  const product = getDemoProduct(url);
-  setScenes(product.scenes);
-  setBrand(product.brand);
-  setApproved(false);
-  setRevision(0);
-  setPhase("running");
-  setCurrent(0);
-};
+  // ---- Helpers ----------------------------------------------------------------
+  const goToStage = (key: StageKey) => {
+    const idx = PIPELINE.findIndex((s) => s.key === key);
+    if (idx >= 0) setCurrent(idx);
+  };
 
-  const approve = useCallback(() => {
-    setApproved(true);
-    setCurrent((c) => c + 1);
+  const failWith = (msg: string) => {
+    setPhase("error");
+    setErrorMsg(msg);
+  };
+
+  // ---- Demo simulation start (unchanged) ------------------------------------
+  const startDemo = () => {
+    const product = getDemoProduct(url);
+    setScenes(product.scenes);
+    setBrand(product.brand);
+    setApproved(false);
+    setRevision(0);
+    setPhase("running");
+    setCurrent(0);
+  };
+
+  // ---- Live mode start (real API calls) -------------------------------------
+  const startLive = async () => {
+    setErrorMsg(null);
+    setVideoUrl(null);
+    setApproved(false);
+    setRevision(0);
+    setPhase("running");
+    goToStage("scraping");
+
+    try {
+      // 1. Ingest — scrape product page
+      const product = await ingestProduct(url || "https://demo.admatrix.ai/products/hydro-smart-bottle");
+      setBrand(mapBrandBook(product));
+
+      // 2. Create campaign
+      const primaryLocale = locales[0] ?? "en-US";
+      const campaign = await createCampaign(
+        product.id,
+        locales,
+        primaryLocale,
+      );
+      campaignIdRef.current = campaign.id;
+
+      // 3. Transcreation + storyboarding (script workflow)
+      goToStage("transcreation");
+      await runScript(campaign.id);
+
+      goToStage("storyboarding");
+      // Poll until AWAITING_APPROVAL
+      await pollCampaignState(campaign.id, ["awaiting_approval"], (c) => {
+        if (c.state === "scripting") goToStage("transcreation");
+      });
+
+      // Fetch the real storyboard and map to frontend Scene[]
+      const storyboard = await getStoryboard(campaign.id);
+      const mappedScenes: Scene[] = storyboard.scenes.map((s, i) => mapScene(s, i));
+      setScenes(mappedScenes);
+
+      // 4. HITL checkpoint — pause for human approval
+      goToStage("awaiting_approval");
+      setPhase("awaiting_approval");
+      // Execution pauses here; the approve/reject buttons call approveLive / reviseLive
+
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.detail : String(err);
+      failWith(msg);
+    }
+  };
+
+  const start = () => {
+    if (IS_DEMO_MODE) {
+      startDemo();
+    } else {
+      startLive();
+    }
+  };
+
+  // ---- Live-mode approval/rejection ----------------------------------------
+  const continueLiveAfterApproval = useCallback(async () => {
+    const cid = campaignIdRef.current;
+    if (!cid) return;
+    try {
+      // Approve the storyboard
+      await approveCampaign(cid, "APPROVE");
+
+      // Audio + video + lip-sync via render pipeline
+      goToStage("audio_generating");
+      setPhase("running");
+      await startRender(cid);
+
+      goToStage("video_rendering");
+      // Poll render status
+      await pollRenderStatus(cid, (task) => {
+        if (task.status === "processing") goToStage("lip_syncing");
+      });
+
+      goToStage("compliance_check");
+      // Compliance runs inside the backend render pipeline; just brief visual hold
+      await new Promise((r) => setTimeout(r, 1200));
+
+      // Fetch the signed video URL
+      try {
+        const urlResp = await getVideoUrl(cid);
+        setVideoUrl(urlResp.video_url);
+      } catch {
+        // Video URL optional — placeholder player still works
+        setVideoUrl(null);
+      }
+
+      setPhase("done");
+      setCurrent(PIPELINE.length - 1);
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.detail : String(err);
+      failWith(msg);
+    }
   }, []);
 
+  const reviseLive = useCallback(async () => {
+    const cid = campaignIdRef.current;
+    if (!cid) return;
+    try {
+      await approveCampaign(cid, "REJECT", "Requested revision");
+      setRevision((r) => r + 1);
+      setApproved(false);
+      goToStage("storyboarding");
+      setPhase("running");
+
+      // Re-run script workflow
+      await runScript(cid);
+      await pollCampaignState(cid, ["awaiting_approval"]);
+      const storyboard = await getStoryboard(cid);
+      const mappedScenes: Scene[] = storyboard.scenes.map((s, i) => mapScene(s, i));
+      setScenes(mappedScenes);
+
+      goToStage("awaiting_approval");
+      setPhase("awaiting_approval");
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.detail : String(err);
+      failWith(msg);
+    }
+  }, []);
+
+  // ---- Approval handlers (demo vs live) ------------------------------------
+  const approve = useCallback(() => {
+    if (IS_DEMO_MODE) {
+      setApproved(true);
+      setCurrent((c) => c + 1);
+    } else {
+      continueLiveAfterApproval();
+    }
+  }, [continueLiveAfterApproval]);
+
   const requestRevision = useCallback(() => {
-    setRevision((r) => r + 1);
-    setApproved(false);
-    setCurrent(storyboardIndex);
-  }, [storyboardIndex]);
+    if (IS_DEMO_MODE) {
+      setRevision((r) => r + 1);
+      setApproved(false);
+      setCurrent(storyboardIndex);
+    } else {
+      reviseLive();
+    }
+  }, [storyboardIndex, reviseLive]);
 
   const reset = useCallback(() => {
     if (timer.current) clearTimeout(timer.current);
@@ -111,6 +277,9 @@ export default function DashboardPage() {
     setPhase("idle");
     setApproved(false);
     setRevision(0);
+    setErrorMsg(null);
+    setVideoUrl(null);
+    campaignIdRef.current = null;
   }, []);
 
   const updateNarration = (idx: number, locale: string, text: string) =>
@@ -136,10 +305,14 @@ export default function DashboardPage() {
 
   return (
     <div className="min-h-screen bg-grid">
-      <NavBar onReset={reset} canReset={current >= 0} />
+      <NavBar onReset={reset} canReset={current >= 0} isLive={!IS_DEMO_MODE} />
 
       <main className="mx-auto max-w-5xl px-4 pb-24 pt-8 sm:px-6">
         <Hero />
+
+        {errorMsg && (
+          <ErrorBanner message={errorMsg} onDismiss={() => { setErrorMsg(null); reset(); }} />
+        )}
 
         <IngestCard
           url={url}
@@ -147,10 +320,10 @@ export default function DashboardPage() {
           locales={locales}
           toggleLocale={toggleLocale}
           onStart={start}
-          running={current >= 0 && phase !== "done"}
+          running={current >= 0 && phase !== "done" && phase !== "error"}
         />
 
-        {current >= 0 && (
+        {current >= 0 && phase !== "error" && (
           <>
             <Stepper current={current} phase={phase} revision={revision} />
             <BrandBookCard brand={brand} />
@@ -168,11 +341,17 @@ export default function DashboardPage() {
           />
         )}
 
-        {current >= 0 && (
+        {current >= 0 && phase !== "error" && (
           <MetricsCard ledger={ledger} totalCost={totalCost} utilization={utilization} />
         )}
 
-        {showVideo && <VideoCard scenes={scenes} locales={activeLocales} />}
+        {showVideo && (
+          <VideoCard
+            scenes={scenes}
+            locales={activeLocales}
+            liveVideoUrl={videoUrl}
+          />
+        )}
       </main>
     </div>
   );
@@ -182,7 +361,15 @@ export default function DashboardPage() {
 /* Layout pieces                                                            */
 /* ----------------------------------------------------------------------- */
 
-function NavBar({ onReset, canReset }: { onReset: () => void; canReset: boolean }) {
+function NavBar({
+  onReset,
+  canReset,
+  isLive,
+}: {
+  onReset: () => void;
+  canReset: boolean;
+  isLive: boolean;
+}) {
   return (
     <header className="sticky top-0 z-30 border-b border-slate-200/70 bg-white/80 backdrop-blur">
       <div className="mx-auto flex max-w-5xl items-center justify-between px-4 py-3 sm:px-6">
@@ -199,9 +386,15 @@ function NavBar({ onReset, canReset }: { onReset: () => void; canReset: boolean 
           <span className="hidden items-center gap-1.5 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-medium text-slate-600 sm:inline-flex">
             <Cpu className="h-3.5 w-3.5 text-brand-500" /> Powered by Qwen Cloud
           </span>
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700 ring-1 ring-emerald-600/20">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> Demo
-          </span>
+          {isLive ? (
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-brand-50 px-3 py-1 text-xs font-semibold text-brand-700 ring-1 ring-brand-600/20">
+              <span className="h-1.5 w-1.5 rounded-full bg-brand-500" /> Live
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700 ring-1 ring-emerald-600/20">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> Demo
+            </span>
+          )}
           {canReset && (
             <button
               onClick={onReset}
@@ -213,6 +406,30 @@ function NavBar({ onReset, canReset }: { onReset: () => void; canReset: boolean 
         </div>
       </div>
     </header>
+  );
+}
+
+function ErrorBanner({
+  message,
+  onDismiss,
+}: {
+  message: string;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="mb-5 flex items-start gap-3 rounded-2xl border border-red-200 bg-red-50 px-5 py-4 animate-fade-up">
+      <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-500" />
+      <div className="flex-1">
+        <p className="text-sm font-semibold text-red-800">Pipeline error</p>
+        <p className="mt-0.5 text-xs text-red-600">{message}</p>
+      </div>
+      <button
+        onClick={onDismiss}
+        className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-red-400 transition hover:bg-red-100"
+      >
+        <X className="h-4 w-4" />
+      </button>
+    </div>
   );
 }
 
@@ -602,9 +819,11 @@ function Stat({ label, value, tone }: { label: string; value: string; tone?: "ok
 function VideoCard({
   scenes,
   locales,
+  liveVideoUrl,
 }: {
   scenes: Scene[];
   locales: { code: string; label: string; flag: string }[];
+  liveVideoUrl?: string | null;
 }) {
   const [locale, setLocale] = useState(locales[0]?.code ?? "en-US");
   const [playing, setPlaying] = useState(true);
@@ -721,9 +940,20 @@ function VideoCard({
           </div>
 
           <div className="mt-4 flex flex-wrap gap-2">
-            <button className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800">
-              <ArrowRight className="h-4 w-4" /> Export MP4
-            </button>
+            {liveVideoUrl ? (
+              <a
+                href={liveVideoUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+              >
+                <ArrowRight className="h-4 w-4" /> Download MP4
+              </a>
+            ) : (
+              <button className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800">
+                <ArrowRight className="h-4 w-4" /> Export MP4
+              </button>
+            )}
             <span className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-700">
               <CheckCircle2 className="h-4 w-4" /> 9:16 · {scenes.reduce((s, x) => s + x.durationSec, 0)}s · {locale}
             </span>
