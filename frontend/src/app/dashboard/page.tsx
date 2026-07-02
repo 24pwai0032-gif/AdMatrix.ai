@@ -24,6 +24,7 @@ import {
   BUDGET_USD,
   COST_LEDGER,
   DEMO_PRODUCT,
+  getDemoProduct,
   LOCALES,
   PIPELINE,
   SAMPLE_URLS,
@@ -50,6 +51,7 @@ export default function DashboardPage() {
   const [approved, setApproved] = useState(false);
   const [revision, setRevision] = useState(0);
   const [scenes, setScenes] = useState<Scene[]>(DEMO_PRODUCT.scenes);
+  const [brand, setBrand] = useState(DEMO_PRODUCT.brand);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const approvalIndex = PIPELINE.findIndex((s) => s.key === "awaiting_approval");
@@ -81,13 +83,16 @@ export default function DashboardPage() {
     };
   }, [current, approved, phase]);
 
-  const start = useCallback(() => {
-    setScenes(DEMO_PRODUCT.scenes);
-    setApproved(false);
-    setRevision(0);
-    setPhase("running");
-    setCurrent(0);
-  }, []);
+  const start = () => {
+  // Load the correct product data for the selected URL
+  const product = getDemoProduct(url);
+  setScenes(product.scenes);
+  setBrand(product.brand);
+  setApproved(false);
+  setRevision(0);
+  setPhase("running");
+  setCurrent(0);
+};
 
   const approve = useCallback(() => {
     setApproved(true);
@@ -148,7 +153,7 @@ export default function DashboardPage() {
         {current >= 0 && (
           <>
             <Stepper current={current} phase={phase} revision={revision} />
-            <BrandBookCard />
+            <BrandBookCard brand={brand} />
           </>
         )}
 
@@ -411,8 +416,7 @@ function Stepper({
   );
 }
 
-function BrandBookCard() {
-  const { brand } = DEMO_PRODUCT;
+function BrandBookCard({ brand }: { brand: typeof DEMO_PRODUCT.brand }) {
   const items = [
     { icon: <Sparkles className="h-4 w-4" />, label: "Product", value: brand.productName },
     { icon: <Wand2 className="h-4 w-4" />, label: "Tone", value: brand.tone },
