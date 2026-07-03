@@ -180,7 +180,7 @@ class ProductIngestService:
             )
 
         payload = {
-            "model": "qwen3.6-plus",
+            "model": "qwen-max",
             "messages": [{"role": "user", "content": content}],
             "response_format": {"type": "json_object"},
         }
@@ -202,7 +202,7 @@ class ProductIngestService:
         except json.JSONDecodeError:
             brand_book = {"raw_analysis": raw_content}
 
-        brand_book["model"] = "qwen3.6-plus"
+        brand_book["model"] = "qwen-max"
         brand_book["image_count"] = len(image_assets)
         return brand_book
 

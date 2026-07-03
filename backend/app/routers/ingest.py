@@ -55,7 +55,7 @@ async def ingest_product(body: CompanyProductCreate, db: AsyncSession = Depends(
     tracker = TokenUsageTracker(db)
     await tracker.log_usage(
         None,
-        UsageRecord(model="qwen3.6-plus", provider=ModelProvider.QWEN, input_tokens=2000, output_tokens=500),
+        UsageRecord(model="qwen-max", provider=ModelProvider.QWEN, input_tokens=2000, output_tokens=500),
     )
     await db.commit()
     return product

@@ -79,7 +79,7 @@ class AdMatrixGuardrail:
 
     async def _qwen_text_audit(self, text: str) -> list[dict[str, str]]:
         payload = {
-            "model": "qwen3.6-plus",
+            "model": "qwen-max",
             "messages": [
                 {
                     "role": "user",
@@ -94,7 +94,7 @@ class AdMatrixGuardrail:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(
                     f"{self.qwen_base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {self.qwen_api_key}"},

@@ -29,7 +29,7 @@ class ModelProvider(str, Enum):
 
 # Per-model cost rates (USD per 1K tokens or per second for video)
 MODEL_COST_RATES: dict[str, dict[str, float]] = {
-    "qwen3.6-plus": {"input_per_1k": 0.002, "output_per_1k": 0.006},
+    "qwen-max": {"input_per_1k": 0.002, "output_per_1k": 0.006},
     "qwen-tts": {"per_second": 0.0001},
     "wan2.7": {"per_second": 0.05},
     "happyhorse": {"per_second": 0.04},

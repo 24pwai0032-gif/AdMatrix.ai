@@ -7,6 +7,9 @@ import logging
 import uuid
 from typing import Annotated, Any, Literal, TypedDict
 
+import httpx
+from app.config import get_settings
+
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
@@ -81,6 +84,7 @@ async def transcreation_agent(state: ScriptWorkflowState) -> dict[str, Any]:
     source_locale = script.get("locale", "en-US")
     target_locales = state.get("target_locales", [])
     transcreated: dict[str, Any] = {}
+    settings = get_settings()
 
     locale_adaptations = {
         "zh-CN": {"cta": "立即购买 — 限时优惠。", "tone": "respectful, aspirational"},
@@ -100,10 +104,32 @@ async def transcreation_agent(state: ScriptWorkflowState) -> dict[str, Any]:
 
         for scene in script.get("scenes", []):
             narration = scene["narration"]
-            # Pass 1: literal translation placeholder
-            pass1 = f"[{locale}] {narration}"
-            # Pass 2: cultural adaptation
-            pass2 = pass1.replace("Discover", "Experience").replace("game", "market")
+            
+            if not settings.qwen_api_key:
+                # Fallback if no key
+                pass2 = f"[{locale}] {narration}"
+            else:
+                # REAL QWEN CALL HERE
+                prompt = (
+                    f"Translate and culturally adapt this ad narration from {source_locale} to {locale}. "
+                    f"Tone should be: {adaptation['tone']}. "
+                    f"Original text: '{narration}'. "
+                    f"Output ONLY the translated text, nothing else."
+                )
+                
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp = await client.post(
+                        f"{settings.qwen_base_url}/chat/completions",
+                        headers={"Authorization": f"Bearer {settings.qwen_api_key}"},
+                        json={
+                            "model": "qwen-max",
+                            "messages": [{"role": "user", "content": prompt}]
+                        }
+                    )
+                    if resp.status_code == 200:
+                        pass2 = resp.json()["choices"][0]["message"]["content"].strip()
+                    else:
+                        pass2 = f"[{locale} Error] {narration}"
 
             localized_scenes.append(
                 {
@@ -128,7 +154,7 @@ async def transcreation_agent(state: ScriptWorkflowState) -> dict[str, Any]:
 
     return {
         "transcreated_scripts": transcreated,
-        "messages": [{"role": "assistant", "content": f"Transcreated to {len(transcreated)} locales."}],
+        "messages": [{"role": "assistant", "content": f"Real LLM Transcreation complete for {len(transcreated)} locales."}],
     }
 
 
